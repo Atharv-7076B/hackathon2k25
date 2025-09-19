@@ -16,16 +16,16 @@ class Command(BaseCommand):
             raise CommandError(f"CSV not found: {csv_path}")
         db = get_db()
 
-        # CSV columns present in the provided file:
-        # train_id, passengers, stations_covered, ticket_sales,
-        # rolling_stock_validity, signalling_validity, telecom_validity,
-        # job_card_status, branding_hours_left, current_mileage,
-        # last_deep_clean_date, stabling_bay
-
         trainsets = []
         jobcards = []
         branding_campaigns = []
         cleaning_slots = []
+
+        def parse_dt(value: str):
+            try:
+                return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return None
 
         with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -34,20 +34,15 @@ class Command(BaseCommand):
                 if not train_id:
                     continue
 
-                # Derive simple statuses
-                def parse_dt(value: str):
-                    try:
-                        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        return None
-
                 now = datetime.utcnow()
                 rolling_valid = parse_dt(row.get("rolling_stock_validity", ""))
                 signalling_valid = parse_dt(row.get("signalling_validity", ""))
                 telecom_valid = parse_dt(row.get("telecom_validity", ""))
-                fitness = "Valid" if all([(rolling_valid and rolling_valid > now), (signalling_valid and signalling_valid > now), (telecom_valid and telecom_valid > now)]) else "Expired"
+                # The earliest validity date is the limiting factor
+                valid_dates = [d for d in [rolling_valid, signalling_valid, telecom_valid] if d]
+                valid_until = min(valid_dates).strftime("%Y-%m-%d %H:%M:%S") if valid_dates else ""
+                fitness = "Valid" if all([(rolling_valid and rolling_valid > now), (signalling_valid and signalling_valid > now), (telecom_valid and telecom_valid > now)]) else ("Due Soon" if any([d and d > now for d in [rolling_valid, signalling_valid, telecom_valid]]) else "Expired")
 
-                # Trainset document
                 campaign_id = f"CMP_{train_id}"
                 trainsets.append({
                     "train_id": train_id,
@@ -60,9 +55,12 @@ class Command(BaseCommand):
                     "stations_covered": int(float(row.get("stations_covered") or 0)),
                     "ticket_sales": float(row.get("ticket_sales") or 0.0),
                     "branding": {"campaign_id": campaign_id},
+                    "rolling_stock_validity": row.get("rolling_stock_validity") or "",
+                    "signalling_validity": row.get("signalling_validity") or "",
+                    "telecom_validity": row.get("telecom_validity") or "",
+                    "valid_until": valid_until,
                 })
 
-                # Jobcard (one per train derived from job_card_status)
                 jobcards.append({
                     "job_id": f"JC_{train_id}_001",
                     "train_id": train_id,
@@ -72,7 +70,6 @@ class Command(BaseCommand):
                     "assigned": "Team A",
                 })
 
-                # Branding campaign derived from branding_hours_left
                 hours_left = int(float(row.get("branding_hours_left") or 0))
                 branding_campaigns.append({
                     "campaign_id": campaign_id,
@@ -82,7 +79,6 @@ class Command(BaseCommand):
                     "train_id": train_id,
                 })
 
-                # Cleaning slot from last_deep_clean_date and bay
                 cleaning_slots.append({
                     "train_id": train_id,
                     "bay": row.get("stabling_bay") or "",
@@ -91,7 +87,6 @@ class Command(BaseCommand):
                     "type": "Deep Clean",
                 })
 
-        # Replace collections
         db.trainsets.delete_many({})
         if trainsets:
             db.trainsets.insert_many(trainsets)
@@ -105,7 +100,6 @@ class Command(BaseCommand):
         if cleaning_slots:
             db.cleaning_slots.insert_many(cleaning_slots)
 
-        # Schedule ranked list: by passengers descending
         ranked = []
         for ts in trainsets:
             ranked.append({"train_id": ts["train_id"], "score": ts.get("passengers", 0)})

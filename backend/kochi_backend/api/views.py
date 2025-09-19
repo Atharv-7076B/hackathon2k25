@@ -24,8 +24,21 @@ def stats_overview(request):
 @permission_classes([AllowAny])
 def fitness_list(request):
     db = get_db()
-    docs = list(db.fitness.find({}, {"_id": 0}))
-    return Response(docs)
+    # Build fitness certificate view from trainsets validity fields
+    rows = []
+    for ts in db.trainsets.find({}, {"_id": 0, "train_id": 1, "rolling_stock_validity": 1, "signalling_validity": 1, "telecom_validity": 1, "valid_until": 1, "fitness": 1}):
+        status = ts.get("fitness") or "Valid"
+        expiry = ts.get("valid_until") or ts.get("rolling_stock_validity") or ts.get("signalling_validity") or ts.get("telecom_validity") or ""
+        cert_type = "Consolidated"
+        risk = "Low" if status == "Valid" else ("Medium" if status == "Due Soon" else "High")
+        rows.append({
+            "trainId": ts.get("train_id"),
+            "status": status,
+            "expiry": expiry,
+            "type": cert_type,
+            "risk": risk,
+        })
+    return Response(rows)
 
 @api_view(["GET"]) 
 @permission_classes([AllowAny])
@@ -38,28 +51,49 @@ def jobcards_list(request):
 @permission_classes([AllowAny])
 def branding_list(request):
     db = get_db()
-    docs = list(db.branding.find({}, {"_id": 0}))
+    # Derive branding view from branding_campaigns
+    docs = []
+    for c in db.branding_campaigns.find({}, {"_id": 0}):
+        docs.append({
+            "campaign": c.get("name"),
+            "train": c.get("train_id"),
+            "status": c.get("status"),
+            "expiry": "",
+            "revenue": "$0"
+        })
     return Response(docs)
 
 @api_view(["GET"]) 
 @permission_classes([AllowAny])
 def mileage_list(request):
     db = get_db()
-    docs = list(db.mileage.find({}, {"_id": 0}))
+    docs = []
+    for ts in db.trainsets.find({}, {"_id": 0, "train_id": 1, "mileage": 1}):
+        docs.append({"trainId": ts.get("train_id"), "mileage": ts.get("mileage"), "target": "100,000", "variance": "-", "efficiency": "-"})
     return Response(docs)
 
 @api_view(["GET"]) 
 @permission_classes([AllowAny])
 def cleaning_list(request):
     db = get_db()
-    docs = list(db.cleaning.find({}, {"_id": 0}))
+    docs = []
+    for c in db.cleaning_slots.find({}, {"_id": 0}):
+        docs.append({
+            "trainId": c.get("train_id"),
+            "bay": c.get("bay"),
+            "time": c.get("time"),
+            "status": c.get("status"),
+            "type": c.get("type"),
+        })
     return Response(docs)
 
 @api_view(["GET"]) 
 @permission_classes([AllowAny])
 def stabling_list(request):
     db = get_db()
-    docs = list(db.stabling.find({}, {"_id": 0}))
+    docs = []
+    for ts in db.trainsets.find({}, {"_id": 0, "train_id": 1, "bay": 1}):
+        docs.append({"trainId": ts.get("train_id"), "bay": str(ts.get("bay") or "-"), "position": "-", "occupied": "-", "depart": "-", "status": "Occupied" if ts.get("bay") else "Available"})
     return Response(docs)
 
 # Train audit (legacy)
@@ -218,3 +252,94 @@ def report_csv(request):
 @permission_classes([AllowAny])
 def report_pdf(request):
     return Response({"detail": "PDF generation not implemented in this demo"}, status=501)
+
+@api_view(["POST"]) 
+@permission_classes([AllowAny])
+def ingest_upload(request):
+    file = request.FILES.get("file")
+    if not file:
+        return Response({"detail": "file is required"}, status=400)
+    try:
+        data = file.read().decode("utf-8")
+    except Exception:
+        return Response({"detail": "failed to read file"}, status=400)
+
+    db = get_db()
+    reader = csv.DictReader(io.StringIO(data))
+
+    def parse_dt(value: str):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    trainsets, jobcards, branding_campaigns, cleaning_slots = [], [], [], []
+    now = datetime.utcnow()
+    for row in reader:
+        train_id = (row.get("train_id") or "").strip()
+        if not train_id:
+            continue
+        rolling_valid = parse_dt(row.get("rolling_stock_validity", ""))
+        signalling_valid = parse_dt(row.get("signalling_validity", ""))
+        telecom_valid = parse_dt(row.get("telecom_validity", ""))
+        valid_dates = [d for d in [rolling_valid, signalling_valid, telecom_valid] if d]
+        valid_until = min(valid_dates).strftime("%Y-%m-%d %H:%M:%S") if valid_dates else ""
+        fitness = "Valid" if all([(rolling_valid and rolling_valid > now), (signalling_valid and signalling_valid > now), (telecom_valid and telecom_valid > now)]) else ("Due Soon" if any([d and d > now for d in [rolling_valid, signalling_valid, telecom_valid]]) else "Expired")
+        campaign_id = f"CMP_{train_id}"
+        trainsets.append({
+            "train_id": train_id,
+            "name": train_id,
+            "fitness": fitness,
+            "status": "Active" if (row.get("job_card_status", "").strip().lower() != "open") else "Maintenance",
+            "mileage": row.get("current_mileage") or "",
+            "bay": row.get("stabling_bay") or "",
+            "passengers": int(float(row.get("passengers") or 0)),
+            "stations_covered": int(float(row.get("stations_covered") or 0)),
+            "ticket_sales": float(row.get("ticket_sales") or 0.0),
+            "branding": {"campaign_id": campaign_id},
+            "rolling_stock_validity": row.get("rolling_stock_validity") or "",
+            "signalling_validity": row.get("signalling_validity") or "",
+            "telecom_validity": row.get("telecom_validity") or "",
+            "valid_until": valid_until,
+        })
+        jobcards.append({
+            "job_id": f"JC_{train_id}_001",
+            "train_id": train_id,
+            "type": "General",
+            "priority": "High" if (row.get("job_card_status", "").strip().lower() == "open") else "Medium",
+            "status": row.get("job_card_status") or "Closed",
+            "assigned": "Team A",
+        })
+        hours_left = int(float(row.get("branding_hours_left") or 0))
+        branding_campaigns.append({
+            "campaign_id": campaign_id,
+            "name": f"Campaign for {train_id}",
+            "status": "Active" if hours_left > 0 else "Expired",
+            "hours_left": hours_left,
+            "train_id": train_id,
+        })
+        cleaning_slots.append({
+            "train_id": train_id,
+            "bay": row.get("stabling_bay") or "",
+            "time": row.get("last_deep_clean_date") or "",
+            "status": "Completed",
+            "type": "Deep Clean",
+        })
+
+    if trainsets:
+        db.trainsets.insert_many(trainsets)
+    if jobcards:
+        db.jobcards.insert_many(jobcards)
+    if branding_campaigns:
+        db.branding_campaigns.insert_many(branding_campaigns)
+    if cleaning_slots:
+        db.cleaning_slots.insert_many(cleaning_slots)
+
+    return Response({
+        "inserted": {
+            "trainsets": len(trainsets),
+            "jobcards": len(jobcards),
+            "branding_campaigns": len(branding_campaigns),
+            "cleaning_slots": len(cleaning_slots)
+        }
+    })

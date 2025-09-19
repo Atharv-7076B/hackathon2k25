@@ -29,4 +29,6 @@ urlpatterns = [
 
     path("reports/pdf/", views.report_pdf),
     path("reports/csv/", views.report_csv),
+
+    path("ingest/upload/", views.ingest_upload),
 ]
